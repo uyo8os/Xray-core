@@ -305,6 +305,9 @@ type VisionWriter struct {
 	testseed []uint32
 }
 
+// SupportsMeteredSplice indicates that CopyRawConnIfExist can use a metered copy.
+func (*VisionWriter) SupportsMeteredSplice() {}
+
 func NewVisionWriter(writer buf.Writer, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, ob *session.Outbound, testseed []uint32) *VisionWriter {
 	w := make([]byte, len(trafficState.UserUUID))
 	copy(w, trafficState.UserUUID)
@@ -730,6 +733,12 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
 	return conn, readCounter, writerCounter
 }
 
+// A meteredSpliceCopier reports bytes written to the destination as copying
+// progresses. It may decline the copy before consuming any input.
+type meteredSpliceCopier interface {
+	CopySplice(ctx context.Context, source net.Conn, target *net.TCPConn, onWrite func(int64)) (handled bool, err error)
+}
+
 // CopyRawConnIfExist use the most efficient copy method.
 // - If caller don't want to turn on splice, do not pass in both reader conn and writer conn
 // - writer are from *transport.Link
@@ -768,8 +777,39 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			}
 		}
 		if splice {
-			errors.LogDebug(ctx, "CopyRawConn splice")
 			statWriter, _ := writer.(*dispatcher.SizeStatWriter)
+			if statWriter != nil {
+				if copier, ok := statWriter.Counter.(meteredSpliceCopier); ok {
+					firstWrite := true
+					handled, err := copier.CopySplice(ctx, readerConn, tc, func(n int64) {
+						if firstWrite {
+							errors.LogDebug(ctx, "CopyRawConn metered splice confirmed")
+							firstWrite = false
+						}
+						timer.Update()
+						if inTimer != nil {
+							inTimer.Update()
+						}
+						if readCounter != nil {
+							readCounter.Add(n)
+						}
+						if writeCounter != nil {
+							writeCounter.Add(n)
+						}
+						statWriter.Counter.Add(n)
+					})
+					if handled {
+						return err
+					}
+					return readV(ctx, reader, writer, timer, readCounter)
+				}
+			}
+			// Keep regular copying when an outbound wraps the meter in another writer.
+			if content := session.ContentFromContext(ctx); content != nil && content.Attribute("v2node:metered-splice") == "true" {
+				return readV(ctx, reader, writer, timer, readCounter)
+			}
+
+			errors.LogDebug(ctx, "CopyRawConn splice")
 			//runtime.Gosched() // necessary
 			timer.SetTimeout(24 * time.Hour) // prevent leak, just in case
 			if inTimer != nil {
